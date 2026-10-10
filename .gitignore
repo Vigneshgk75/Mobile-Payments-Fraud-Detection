@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.csv
+*.json
+final/
+results/
+results_autodrop/
