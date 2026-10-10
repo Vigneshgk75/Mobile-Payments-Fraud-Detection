@@ -399,7 +399,11 @@ def main():
     ap.add_argument("--tune-neg-cap", type=int, default=300000, help="negatives used while tuning (all frauds kept)")
     ap.add_argument("--auto-drop", action="store_true",
                     help="also drop audit-flagged features from F2 (review the audit first)")
-    ap.add_argument("--rolling", type=int, default=5)
+    ap.add_argument("--rolling", type=int, default=5, help="rolling-origin windows for stability (0 or 1 = skip)")
+    ap.add_argument("--sets", nargs="+", default=["F0", "F1", "F2"], choices=["F0", "F1", "F2"],
+                    help="feature sets to run; identical sets are fitted once and reused")
+    ap.add_argument("--skip-audit", action="store_true", help="skip the audit fits (reuse an earlier audit.json)")
+    ap.add_argument("--no-shap", action="store_true", help="skip the SHAP step")
     ap.add_argument("--train-frac", type=float, default=0.60)
     ap.add_argument("--val-frac", type=float, default=0.15)
     ap.add_argument("--test-from", type=float, default=None,
@@ -430,8 +434,12 @@ def main():
 
     F1 = list(X.columns)
     F0 = [col for col in F1 if group_of(col) == "raw"]
-    rep = audit(Xtr, ytr, 0)
-    rep.update(shuffled_label_check(Xtr, ytr, Xte, yte, 0))
+    if a.skip_audit:
+        rep = {"flagged": {}, "top4_share": float("nan"), "pr_auc_shuffled": float("nan"),
+               "prevalence_test": float(yte.mean())}
+    else:
+        rep = audit(Xtr, ytr, 0)
+        rep.update(shuffled_label_check(Xtr, ytr, Xte, yte, 0))
     drop = {col for col in F1 if group_of(col) == "bal"}
     if a.auto_drop:
         drop |= set(rep["flagged"])
@@ -451,9 +459,21 @@ def main():
         json.dump(best, open(out / "best_params.json", "w"), indent=2)
     scores = {}
     for seed in range(a.seeds):
-        for fs, cols in sets.items():
+        seen = {}
+        for fs in a.sets:
+            cols = sets[fs]
             if fs == "F0" and not F0:
                 continue
+            if tuple(cols) in seen:  # identical feature set already fitted: reuse its results
+                src = seen[tuple(cols)]
+                for r in [r for r in rows if r["feature_set"] == src and r["seed"] == seed]:
+                    rows.append({**r, "feature_set": fs})
+                if seed == 0:
+                    for (f2, m2, t2), v in list(scores.items()):
+                        if f2 == src:
+                            scores[(fs, m2, t2)] = v
+                continue
+            seen[tuple(cols)] = fs
             for m in a.models:
                 for tr_ in (["none"] if m == "iforest" else a.treatments):
                     model, (sv, st) = fit_predict(m, Xtr[cols], ytr, tr_, seed, Xva[cols], Xte[cols], params=best.get(m))
@@ -492,9 +512,14 @@ def main():
         print(pd.DataFrame(diffs).round(4).to_string(index=False))
 
     # SHAP group importance and rolling stability (xgb)
-    for fs in ("F1", "F2"):
-        model, _ = fit_predict("xgb", Xtr[sets[fs]], ytr, "weight", 0)
-        feat, grp = shap_groups(model, Xte[sets[fs]], yte, 0)
+    shap_done = {}
+    for fs in (() if a.no_shap else ("F1", "F2")):
+        if tuple(sets[fs]) in shap_done:
+            feat, grp = shap_done[tuple(sets[fs])]
+        else:
+            model, _ = fit_predict("xgb", Xtr[sets[fs]], ytr, "weight", 0, params=best.get("xgb"))
+            feat, grp = shap_groups(model, Xte[sets[fs]], yte, 0)
+            shap_done[tuple(sets[fs])] = (feat, grp)
         feat.head(30).to_csv(out / f"shap_features_{fs}.csv", header=["mean_abs_shap"])
         grp.to_csv(out / f"shap_groups_{fs}.csv", header=["mean_abs_shap"])
         rep[f"shap_top4_share_{fs}"] = float(feat.head(4).sum() / feat.sum())
